@@ -2403,6 +2403,12 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             
             # Register handlers
+            # /card photo handler MUST register before the generic PHOTO handler below
+            # so the CaptionRegex match wins precedence. Wired 2026-06-25 (Hermes v0.17.0).
+            self._app.add_handler(TelegramMessageHandler(
+                filters.PHOTO & filters.CaptionRegex(r"(?i)^/card\b"),
+                self._handle_card_photo
+            ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
@@ -6848,6 +6854,108 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         await self.handle_message(event)
+
+    async def _handle_card_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle a photo whose caption starts with /card — run the business-card pipeline.
+
+        Registered BEFORE the generic PHOTO handler so CaptionRegex wins precedence.
+        Wired 2026-06-25 (Hermes v0.17.0). Multi-card aware: iterates result["cards"].
+        """
+        msg = update.message
+        if not (msg and msg.photo):
+            return
+
+        chat_id = update.effective_chat.id
+        s_chat_id = int(os.environ.get("S_TELEGRAM_CHAT_ID", "0"))
+        if s_chat_id and chat_id != s_chat_id:
+            logger.warning("[/card] rejected chat_id=%s (not S)", chat_id)
+            return
+
+        caption = (msg.caption or "").strip()
+        # strip leading /card (case-insensitive); keep the rest as met-context
+        if caption.lower().startswith("/card"):
+            caption = caption[5:].lstrip()
+
+        tmpdir = tempfile.mkdtemp(prefix="hermes_card_")
+        outdir = os.path.join(tmpdir, "out")
+        os.makedirs(outdir, exist_ok=True)
+        image_path = os.path.join(tmpdir, "card.jpg")
+
+        # Acknowledge receipt to prevent gateway timeout
+        ack = await context.bot.send_message(
+            chat_id=chat_id, text="Processing business card…"
+        )
+
+        try:
+            photo = msg.photo[-1]
+            file_obj = await photo.get_file()
+            await file_obj.download_to_drive(image_path)
+
+            # Lazy import — card_pipeline uses sibling-module relative imports,
+            # so we have to add its directory to sys.path. Defer to handler-time
+            # so adapter import succeeds even if hermes_scripts isn't on PYTHONPATH.
+            import sys as _sys
+            _card_dir = "/home/s/hermes_scripts/business_card"
+            if _card_dir not in _sys.path:
+                _sys.path.insert(0, _card_dir)
+            from card_pipeline import process_card
+
+            result = await asyncio.to_thread(
+                process_card, image_path, caption, outdir
+            )
+
+            n = result.get("n_cards", 0)
+            if n == 0:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=ack.message_id,
+                    text=result.get("header_summary") or "No cards detected in image.",
+                )
+                return
+
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=ack.message_id,
+                text=result.get("header_summary", f"Processed {n} card(s)."),
+            )
+
+            for idx, card in enumerate(result.get("cards", []), start=1):
+                summary = card.get("summary", "")
+                vcf = card.get("vcf_path")
+                md = card.get("md_path")
+                prefix = f"[{idx}/{n}] " if n > 1 else ""
+
+                if summary:
+                    await context.bot.send_message(chat_id=chat_id, text=f"{prefix}{summary}")
+
+                if vcf and os.path.exists(vcf):
+                    with open(vcf, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id, document=f,
+                            filename=os.path.basename(vcf),
+                            caption=f"{prefix}iPhone Contact (.vcf)",
+                        )
+                if md and os.path.exists(md):
+                    with open(md, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id, document=f,
+                            filename=os.path.basename(md),
+                            caption=f"{prefix}Vault stub → save to Obsidian/Life/03-Counterparties/People/",
+                        )
+
+        except Exception as exc:
+            logger.exception("[/card] pipeline failed")
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=ack.message_id,
+                    text=f"❌ Card pipeline failed: {type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+        finally:
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.
