@@ -15,6 +15,9 @@ import logging
 import os
 import html as _html
 import re
+import tempfile
+import io
+import secrets
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
@@ -2891,11 +2894,17 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             
             # Register handlers
-            # /card photo handler MUST register before the generic PHOTO handler below
-            # so the CaptionRegex match wins precedence. Wired 2026-06-25 (Hermes v0.17.0).
+            # /card handlers MUST register before the generic COMMAND and PHOTO
+            # handlers below so they are not swallowed by normal gateway dispatch.
+            self._app.add_handler(CommandHandler(
+                "card", self._handle_card_command
+            ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.PHOTO & filters.CaptionRegex(r"(?i)^/card\b"),
                 self._handle_card_photo
+            ))
+            self._app.add_handler(TelegramMessageHandler(
+                filters.PHOTO, self._handle_card_mode_photo
             ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -4912,6 +4921,10 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        if data.startswith("cp:"):
+            await self._handle_card_photo_approval(query, data)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mc:", "mb", "mx", "mg:")):
@@ -7292,6 +7305,14 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
             return
+        msg = update.message
+        handled_card_ids = getattr(self, "_card_handled_message_ids", set())
+        if msg.photo and (
+            (msg.caption or "").strip().lower().startswith("/card")
+            or getattr(msg, "message_id", None) in handled_card_ids
+        ):
+            logger.debug("[/card] suppressing duplicate generic-media dispatch")
+            return
         if not self._is_user_authorized_from_message(update.message):
             logger.info(
                 "[Telegram] Blocked media from unauthorized user %s in chat %s",
@@ -7311,8 +7332,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     _m, _event.message_type, update_id=update.update_id, event=_event
                 )
             return
-
-        msg = update.message
 
         msg_type = self._media_message_type(msg)
 
@@ -7569,6 +7588,41 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await self.handle_message(event)
 
+    async def _handle_card_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Explain the camera-first /card flow instead of sending it to the agent."""
+        msg = update.message
+        if not msg:
+            return
+
+        chat_id = update.effective_chat.id
+        s_chat_id = int(os.environ.get("S_TELEGRAM_CHAT_ID", "0"))
+        if s_chat_id and chat_id != s_chat_id:
+            logger.warning("[/card] rejected chat_id=%s (not S)", chat_id)
+            return
+
+        context.user_data["_hermes_card_mode_until"] = (
+            asyncio.get_running_loop().time() + 300
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "📇 Ready—take or choose a business-card photo now. "
+                "Your next photo within 5 minutes will be processed as a card.\n\n"
+                "You can also put /card in a photo caption anytime, with optional "
+                "context after it, e.g. /card Met at ULI.\n\n"
+                "I’ll return an iPhone-ready .vcf, the LinkedIn match I found, "
+                "and a separate contact photo."
+            ),
+        )
+
+    async def _handle_card_mode_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Route the next photo after `/card` to the card pipeline."""
+        deadline = context.user_data.pop("_hermes_card_mode_until", 0)
+        if deadline and asyncio.get_running_loop().time() <= deadline:
+            await self._handle_card_photo(update, context)
+            return
+        await self._handle_media_message(update, context)
+
     async def _handle_card_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle a photo whose caption starts with /card — run the business-card pipeline.
 
@@ -7578,6 +7632,13 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = update.message
         if not (msg and msg.photo):
             return
+
+        handled_card_ids = getattr(self, "_card_handled_message_ids", set())
+        handled_card_ids.add(getattr(msg, "message_id", None))
+        handled_card_ids.discard(None)
+        if len(handled_card_ids) > 100:
+            handled_card_ids = set(list(handled_card_ids)[-100:])
+        self._card_handled_message_ids = handled_card_ids
 
         chat_id = update.effective_chat.id
         s_chat_id = int(os.environ.get("S_TELEGRAM_CHAT_ID", "0"))
@@ -7628,12 +7689,17 @@ class TelegramAdapter(BasePlatformAdapter):
 
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=ack.message_id,
-                text=result.get("header_summary", f"Processed {n} card(s)."),
+                text=result.get("header_summary") or f"Processed {n} card(s).",
             )
 
             for idx, card in enumerate(result.get("cards", []), start=1):
                 summary = card.get("summary", "")
                 vcf = card.get("vcf_path")
+                contact_photo = card.get("photo_path")
+                photo_source = card.get("photo_source", "card")
+                candidate_photo = card.get("candidate_photo_path")
+                candidate_vcf = card.get("candidate_vcf_path")
+                candidate_source = card.get("candidate_source_url", "")
                 md = card.get("md_path")
                 prefix = f"[{idx}/{n}] " if n > 1 else ""
 
@@ -7646,6 +7712,43 @@ class TelegramAdapter(BasePlatformAdapter):
                             chat_id=chat_id, document=f,
                             filename=os.path.basename(vcf),
                             caption=f"{prefix}iPhone Contact (.vcf)",
+                        )
+                if contact_photo and os.path.exists(contact_photo):
+                    with open(contact_photo, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id, document=f,
+                            filename=os.path.basename(contact_photo),
+                            caption=f"{prefix}Contact photo ({photo_source})",
+                        )
+                if (candidate_photo and candidate_vcf
+                        and os.path.exists(candidate_photo) and os.path.exists(candidate_vcf)):
+                    token = secrets.token_urlsafe(6)
+                    if not hasattr(self, "_card_photo_candidates"):
+                        self._card_photo_candidates = {}
+                    with open(candidate_photo, "rb") as f:
+                        photo_payload = f.read()
+                    with open(candidate_vcf, "rb") as f:
+                        vcf_payload = f.read()
+                    self._card_photo_candidates[token] = {
+                        "chat_id": chat_id,
+                        "photo": photo_payload,
+                        "vcf": vcf_payload,
+                        "vcf_name": os.path.basename(candidate_vcf),
+                        "source": candidate_source,
+                        "expires": asyncio.get_running_loop().time() + 900,
+                    }
+                    keyboard = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("Use this photo", callback_data=f"cp:y:{token}"),
+                        InlineKeyboardButton("Reject", callback_data=f"cp:n:{token}"),
+                    ]])
+                    with open(candidate_photo, "rb") as f:
+                        await context.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=f,
+                            caption=(f"{prefix}Unverified online photo candidate\n"
+                                     f"Source: {candidate_source or 'online search'}\n"
+                                     "Only use it if this is the correct person."),
+                            reply_markup=keyboard,
                         )
                 if md and os.path.exists(md):
                     with open(md, "rb") as f:
@@ -7670,6 +7773,49 @@ class TelegramAdapter(BasePlatformAdapter):
                 _shutil.rmtree(tmpdir, ignore_errors=True)
             except Exception:
                 pass
+
+    async def _handle_card_photo_approval(self, query, data: str) -> None:
+        """Approve/reject an unverified candidate before embedding it in a vCard."""
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid card-photo action.")
+            return
+        choice, token = parts[1], parts[2]
+        candidates = getattr(self, "_card_photo_candidates", {})
+        entry = candidates.pop(token, None)
+        if not entry or asyncio.get_running_loop().time() > entry["expires"]:
+            await query.answer(text="This photo approval expired. Please scan again.", show_alert=True)
+            return
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(caller_id, chat_id=str(entry["chat_id"])):
+            await query.answer(text="Not authorized.", show_alert=True)
+            return
+        if choice != "y":
+            await query.answer(text="Photo rejected.")
+            try:
+                await query.edit_message_caption(
+                    caption="Unverified online photo rejected — contact left unchanged.",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+        payload = io.BytesIO(entry["vcf"])
+        payload.name = entry["vcf_name"]
+        await query.answer(text="Photo approved.")
+        await self._bot.send_document(
+            chat_id=entry["chat_id"],
+            document=payload,
+            filename=entry["vcf_name"],
+            caption="Approved photo embedded — import this updated contact (.vcf)",
+        )
+        try:
+            await query.edit_message_caption(
+                caption="Online photo approved and embedded in the updated .vcf.",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.
