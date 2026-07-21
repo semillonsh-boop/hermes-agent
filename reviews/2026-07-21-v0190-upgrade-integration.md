@@ -41,4 +41,6 @@ Upgrade the live gateway from v0.18.0 to the signed `v2026.7.20` tag on a dedica
 - The first external 75-line Telegram test exposed a v0.19 streaming-finalisation defect: item 63 was lost and item 64 was split. Raw `state.db` content was complete, proving the defect was transport-side rather than model-side.
 - Mitigation: `display.platforms.telegram.streaming: false`. Telegram rich messages and rich drafts were already disabled. The repeated external test delivered all items 1-75 across two complete chunks.
 - Live Telegram reply after the final restart began with the real `s· ` canary and reported v0.19.0 healthy.
+- The v0.19 system service definition was refreshed after a deep-status warning. The custom `.env` drop-in survived, `RestartPreventExitStatus=78` is now present, and the deep check no longer reports the unit as outdated.
+- The immediate startup notification logged `send_path_degraded` while Telegram was still connecting; a subsequent real Telegram turn completed normally, so this was transient rather than a live transport failure.
 - `/card` registry, chunk integrity, and authorised-user behaviour are covered by `tests/gateway/test_shelson_telegram_customizations.py`. A real photo was not uploaded because that would create contact artefacts from a non-source test image.
