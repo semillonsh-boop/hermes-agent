@@ -19,6 +19,9 @@ import re
 import threading
 import time
 from contextvars import ContextVar
+import tempfile
+import io
+import secrets
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
@@ -467,6 +470,135 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
     closing fence.
     """
     return _CHUNK_INDICATOR_ON_FENCE_RE.sub(r'```\n\g<indicator>', text)
+
+
+# ---------------------------------------------------------------------------
+# MarkdownV2 chunk safety (2026-07-11 LOCAL PATCH, Claude/Cowork — re-apply
+# after `hermes update`; same class as the old telegram.py 409 patch)
+# ---------------------------------------------------------------------------
+# truncate_message() splits at newlines/spaces without entity awareness, so a
+# multi-chunk reply can cut a [link](url), ~strikethrough~ or *bold* span in
+# half. Telegram then rejects the chunk ("can't find end of ... entity at
+# byte offset 0") and the send path degrades it to stripped plain text — the
+# user receives broken half-entities ("garbage text", S report 2026-07-11).
+# These helpers re-split the FORMATTED text at line boundaries: entities
+# produced by format_message never span lines, except fenced code blocks,
+# which are closed and reopened explicitly. Every chunk then parses alone.
+
+
+def _mdv2_chunk_balanced(chunk: str) -> bool:
+    """True if *chunk* has no obviously-unterminated MarkdownV2 entity.
+
+    Cheap parity scan over a format_message() output slice. Used to decide
+    whether generic truncate_message() chunks are individually sendable with
+    parse_mode=MarkdownV2, or whether the reply must be re-split at line
+    boundaries via _mdv2_rechunk().
+    """
+    s = re.sub(r'\\[_*\[\]()~`>#+\-=|{}.!\\]', '', chunk)  # drop escaped chars
+    if s.count('```') % 2:
+        return False
+    s = re.sub(r'```[\s\S]*?```', '', s)          # drop fenced code bodies
+    s = re.sub(r'`[^`\n]*`', '', s)               # drop inline code bodies
+    if '`' in s:
+        return False
+    s = re.sub(r'\[[^\]\n]*\]\([^)\n]*\)', '', s)  # drop balanced links
+    if '[' in s or '](' in s:
+        return False
+    if s.count('||') % 2:
+        return False
+    s = s.replace('||', '')
+    if s.count('*') % 2 or s.count('~') % 2:
+        return False
+    if s.count('__') % 2:
+        return False
+    if s.replace('__', '').count('_') % 2:
+        return False
+    return True
+
+
+def _mdv2_fence_toggles(line: str) -> int:
+    """Count unescaped ``` occurrences in *line* (fence state toggles)."""
+    i = 0
+    n = 0
+    while True:
+        j = line.find('```', i)
+        if j == -1:
+            return n
+        bs = 0
+        k = j - 1
+        while k >= 0 and line[k] == '\\':
+            bs += 1
+            k -= 1
+        if bs % 2 == 0:
+            n += 1
+        i = j + 3
+
+
+def _mdv2_rechunk(formatted: str, max_length: int, len_fn) -> "Optional[List[str]]":
+    """Split formatted MarkdownV2 text at line boundaries into parse-safe chunks.
+
+    Inline entities never span lines in format_message() output, so cutting at
+    newlines keeps every entity whole. Fenced code blocks are the exception —
+    a chunk boundary inside a fence closes it and reopens it (with language
+    tag) at the top of the next chunk, mirroring truncate_message()'s fence
+    handling. Chunk indicators are appended pre-escaped ("\\(1/3\\)").
+
+    Returns None when a compliant split is impossible (a single line longer
+    than the budget, or a resulting chunk that still fails the balance scan);
+    the caller then keeps the generic chunks and relies on the existing
+    plain-text fallback.
+    """
+    budget = max_length - 24  # headroom: fence reopen + " \\(NN/NN\\)"
+    if budget < 256:
+        return None
+    lines = formatted.split('\n')
+    raw_chunks = []
+    cur = []
+    cur_len = 0
+    in_fence = False
+    fence_open = '```'
+    for line in lines:
+        line_len = len_fn(line)
+        if line_len > budget:
+            return None
+        joiner = 1 if cur else 0
+        if cur and cur_len + joiner + line_len > budget:
+            if in_fence:
+                cur.append('```')
+                raw_chunks.append('\n'.join(cur))
+                cur = [fence_open]
+                cur_len = len_fn(fence_open)
+            else:
+                raw_chunks.append('\n'.join(cur))
+                cur = []
+                cur_len = 0
+            joiner = 1 if cur else 0
+        cur.append(line)
+        cur_len += joiner + line_len
+        if _mdv2_fence_toggles(line) % 2:
+            in_fence = not in_fence
+            if in_fence:
+                tag = line.strip()
+                if tag.startswith('```') and '```' not in tag[3:]:
+                    fence_open = tag
+                else:
+                    fence_open = '```'
+    if cur:
+        raw_chunks.append('\n'.join(cur))
+    if len(raw_chunks) < 2:
+        return raw_chunks or None
+    total = len(raw_chunks)
+    out = []
+    for idx, chunk in enumerate(raw_chunks, 1):
+        indicator = '\\({0}/{1}\\)'.format(idx, total)
+        if chunk.rstrip().endswith('```'):
+            candidate = chunk + '\n' + indicator
+        else:
+            candidate = chunk + ' ' + indicator
+        if len_fn(candidate) > max_length or not _mdv2_chunk_balanced(candidate):
+            return None
+        out.append(candidate)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -3574,6 +3706,18 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             
             # Register handlers
+            # /card handlers MUST register before the generic COMMAND and PHOTO
+            # handlers below so they are not swallowed by normal gateway dispatch.
+            self._app.add_handler(CommandHandler(
+                "card", self._handle_card_command
+            ))
+            self._app.add_handler(TelegramMessageHandler(
+                filters.PHOTO & filters.CaptionRegex(r"(?i)^/card\b"),
+                self._handle_card_photo
+            ))
+            self._app.add_handler(TelegramMessageHandler(
+                filters.PHOTO, self._handle_card_mode_photo
+            ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
@@ -4046,6 +4190,18 @@ class TelegramAdapter(BasePlatformAdapter):
             chunks = self.truncate_message(
                 formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
             )
+            if len(chunks) > 1 and not all(
+                _mdv2_chunk_balanced(_c) for _c in chunks
+            ):
+                # 2026-07-11: the generic split cut a MarkdownV2 entity in
+                # half (Telegram rejects the chunk -> plain-text degrade ->
+                # 'garbage text'). Re-split at line boundaries so every
+                # chunk parses on its own; keep generic chunks if impossible.
+                _safe_chunks = _mdv2_rechunk(
+                    formatted, self.MAX_MESSAGE_LENGTH, utf16_len,
+                )
+                if _safe_chunks:
+                    chunks = _safe_chunks
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
@@ -5891,6 +6047,10 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        if data.startswith("cp:"):
+            await self._handle_card_photo_approval(query, data)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
@@ -8373,6 +8533,14 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
             return
+        msg = update.message
+        handled_card_ids = getattr(self, "_card_handled_message_ids", set())
+        if msg.photo and (
+            (msg.caption or "").strip().lower().startswith("/card")
+            or getattr(msg, "message_id", None) in handled_card_ids
+        ):
+            logger.debug("[/card] suppressing duplicate generic-media dispatch")
+            return
         if not self._is_user_authorized_from_message(update.message):
             logger.info(
                 "[Telegram] Blocked media from unauthorized user %s in chat %s",
@@ -8392,8 +8560,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     _m, _event.message_type, update_id=update.update_id, event=_event
                 )
             return
-
-        msg = update.message
 
         msg_type = self._media_message_type(msg)
 
@@ -8649,6 +8815,233 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         await self.handle_message(event)
+
+    async def _handle_card_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Explain the camera-first /card flow instead of sending it to the agent."""
+        msg = update.message
+        if not msg:
+            return
+
+        if not self._is_user_authorized_from_message(msg):
+            logger.warning("[/card] rejected unauthorized user/chat")
+            return
+        chat_id = update.effective_chat.id
+
+        context.user_data["_hermes_card_mode_until"] = (
+            asyncio.get_running_loop().time() + 300
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "📇 Ready—take or choose a business-card photo now. "
+                "Your next photo within 5 minutes will be processed as a card.\n\n"
+                "You can also put /card in a photo caption anytime, with optional "
+                "context after it, e.g. /card Met at ULI.\n\n"
+                "I’ll return an iPhone-ready .vcf, the LinkedIn match I found, "
+                "and a separate contact photo."
+            ),
+        )
+
+    async def _handle_card_mode_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Route the next photo after `/card` to the card pipeline."""
+        deadline = context.user_data.pop("_hermes_card_mode_until", 0)
+        if deadline and asyncio.get_running_loop().time() <= deadline:
+            await self._handle_card_photo(update, context)
+            return
+        await self._handle_media_message(update, context)
+
+    async def _handle_card_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle a photo whose caption starts with /card — run the business-card pipeline.
+
+        Registered BEFORE the generic PHOTO handler so CaptionRegex wins precedence.
+        Wired 2026-06-25 (Hermes v0.17.0). Multi-card aware: iterates result["cards"].
+        """
+        msg = update.message
+        if not (msg and msg.photo):
+            return
+
+        handled_card_ids = getattr(self, "_card_handled_message_ids", set())
+        handled_card_ids.add(getattr(msg, "message_id", None))
+        handled_card_ids.discard(None)
+        if len(handled_card_ids) > 100:
+            handled_card_ids = set(list(handled_card_ids)[-100:])
+        self._card_handled_message_ids = handled_card_ids
+
+        if not self._is_user_authorized_from_message(msg):
+            logger.warning("[/card] rejected unauthorized user/chat")
+            return
+        chat_id = update.effective_chat.id
+
+        caption = (msg.caption or "").strip()
+        # strip leading /card (case-insensitive); keep the rest as met-context
+        if caption.lower().startswith("/card"):
+            caption = caption[5:].lstrip()
+
+        tmpdir = tempfile.mkdtemp(prefix="hermes_card_")
+        outdir = os.path.join(tmpdir, "out")
+        os.makedirs(outdir, exist_ok=True)
+        image_path = os.path.join(tmpdir, "card.jpg")
+
+        # Acknowledge receipt to prevent gateway timeout
+        ack = await context.bot.send_message(
+            chat_id=chat_id, text="Processing business card…"
+        )
+
+        try:
+            photo = msg.photo[-1]
+            file_obj = await photo.get_file()
+            await file_obj.download_to_drive(image_path)
+
+            # Lazy import — card_pipeline uses sibling-module relative imports,
+            # so we have to add its directory to sys.path. Defer to handler-time
+            # so adapter import succeeds even if hermes_scripts isn't on PYTHONPATH.
+            import sys as _sys
+            _card_dir = "/home/s/hermes_scripts/business_card"
+            if _card_dir not in _sys.path:
+                _sys.path.insert(0, _card_dir)
+            from card_pipeline import process_card
+
+            result = await asyncio.to_thread(
+                process_card, image_path, caption, outdir
+            )
+
+            n = result.get("n_cards", 0)
+            if n == 0:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=ack.message_id,
+                    text=result.get("header_summary") or "No cards detected in image.",
+                )
+                return
+
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=ack.message_id,
+                text=result.get("header_summary") or f"Processed {n} card(s).",
+            )
+
+            for idx, card in enumerate(result.get("cards", []), start=1):
+                summary = card.get("summary", "")
+                vcf = card.get("vcf_path")
+                contact_photo = card.get("photo_path")
+                photo_source = card.get("photo_source", "card")
+                candidate_photo = card.get("candidate_photo_path")
+                candidate_vcf = card.get("candidate_vcf_path")
+                candidate_source = card.get("candidate_source_url", "")
+                md = card.get("md_path")
+                prefix = f"[{idx}/{n}] " if n > 1 else ""
+
+                if summary:
+                    await context.bot.send_message(chat_id=chat_id, text=f"{prefix}{summary}")
+
+                if vcf and os.path.exists(vcf):
+                    with open(vcf, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id, document=f,
+                            filename=os.path.basename(vcf),
+                            caption=f"{prefix}iPhone Contact (.vcf)",
+                        )
+                if contact_photo and os.path.exists(contact_photo):
+                    with open(contact_photo, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id, document=f,
+                            filename=os.path.basename(contact_photo),
+                            caption=f"{prefix}Contact photo ({photo_source})",
+                        )
+                if (candidate_photo and candidate_vcf
+                        and os.path.exists(candidate_photo) and os.path.exists(candidate_vcf)):
+                    token = secrets.token_urlsafe(6)
+                    if not hasattr(self, "_card_photo_candidates"):
+                        self._card_photo_candidates = {}
+                    with open(candidate_photo, "rb") as f:
+                        photo_payload = f.read()
+                    with open(candidate_vcf, "rb") as f:
+                        vcf_payload = f.read()
+                    self._card_photo_candidates[token] = {
+                        "chat_id": chat_id,
+                        "photo": photo_payload,
+                        "vcf": vcf_payload,
+                        "vcf_name": os.path.basename(candidate_vcf),
+                        "source": candidate_source,
+                        "expires": asyncio.get_running_loop().time() + 900,
+                    }
+                    keyboard = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("Use this photo", callback_data=f"cp:y:{token}"),
+                        InlineKeyboardButton("Reject", callback_data=f"cp:n:{token}"),
+                    ]])
+                    with open(candidate_photo, "rb") as f:
+                        await context.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=f,
+                            caption=(f"{prefix}Unverified online photo candidate\n"
+                                     f"Source: {candidate_source or 'online search'}\n"
+                                     "Only use it if this is the correct person."),
+                            reply_markup=keyboard,
+                        )
+                if md and os.path.exists(md):
+                    with open(md, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id, document=f,
+                            filename=os.path.basename(md),
+                            caption=f"{prefix}Vault stub → save to Obsidian/Life/03-Counterparties/People/",
+                        )
+
+        except Exception as exc:
+            logger.exception("[/card] pipeline failed")
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=ack.message_id,
+                    text=f"❌ Card pipeline failed: {type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+        finally:
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
+    async def _handle_card_photo_approval(self, query, data: str) -> None:
+        """Approve/reject an unverified candidate before embedding it in a vCard."""
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid card-photo action.")
+            return
+        choice, token = parts[1], parts[2]
+        candidates = getattr(self, "_card_photo_candidates", {})
+        entry = candidates.pop(token, None)
+        if not entry or asyncio.get_running_loop().time() > entry["expires"]:
+            await query.answer(text="This photo approval expired. Please scan again.", show_alert=True)
+            return
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(caller_id, chat_id=str(entry["chat_id"])):
+            await query.answer(text="Not authorized.", show_alert=True)
+            return
+        if choice != "y":
+            await query.answer(text="Photo rejected.")
+            try:
+                await query.edit_message_caption(
+                    caption="Unverified online photo rejected — contact left unchanged.",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+        payload = io.BytesIO(entry["vcf"])
+        payload.name = entry["vcf_name"]
+        await query.answer(text="Photo approved.")
+        await self._bot.send_document(
+            chat_id=entry["chat_id"],
+            document=payload,
+            filename=entry["vcf_name"],
+            caption="Approved photo embedded — import this updated contact (.vcf)",
+        )
+        try:
+            await query.edit_message_caption(
+                caption="Online photo approved and embedded in the updated .vcf.",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.
