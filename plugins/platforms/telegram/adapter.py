@@ -219,6 +219,135 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# MarkdownV2 chunk safety (2026-07-11 LOCAL PATCH, Claude/Cowork — re-apply
+# after `hermes update`; same class as the old telegram.py 409 patch)
+# ---------------------------------------------------------------------------
+# truncate_message() splits at newlines/spaces without entity awareness, so a
+# multi-chunk reply can cut a [link](url), ~strikethrough~ or *bold* span in
+# half. Telegram then rejects the chunk ("can't find end of ... entity at
+# byte offset 0") and the send path degrades it to stripped plain text — the
+# user receives broken half-entities ("garbage text", S report 2026-07-11).
+# These helpers re-split the FORMATTED text at line boundaries: entities
+# produced by format_message never span lines, except fenced code blocks,
+# which are closed and reopened explicitly. Every chunk then parses alone.
+
+
+def _mdv2_chunk_balanced(chunk: str) -> bool:
+    """True if *chunk* has no obviously-unterminated MarkdownV2 entity.
+
+    Cheap parity scan over a format_message() output slice. Used to decide
+    whether generic truncate_message() chunks are individually sendable with
+    parse_mode=MarkdownV2, or whether the reply must be re-split at line
+    boundaries via _mdv2_rechunk().
+    """
+    s = re.sub(r'\\[_*\[\]()~`>#+\-=|{}.!\\]', '', chunk)  # drop escaped chars
+    if s.count('```') % 2:
+        return False
+    s = re.sub(r'```[\s\S]*?```', '', s)          # drop fenced code bodies
+    s = re.sub(r'`[^`\n]*`', '', s)               # drop inline code bodies
+    if '`' in s:
+        return False
+    s = re.sub(r'\[[^\]\n]*\]\([^)\n]*\)', '', s)  # drop balanced links
+    if '[' in s or '](' in s:
+        return False
+    if s.count('||') % 2:
+        return False
+    s = s.replace('||', '')
+    if s.count('*') % 2 or s.count('~') % 2:
+        return False
+    if s.count('__') % 2:
+        return False
+    if s.replace('__', '').count('_') % 2:
+        return False
+    return True
+
+
+def _mdv2_fence_toggles(line: str) -> int:
+    """Count unescaped ``` occurrences in *line* (fence state toggles)."""
+    i = 0
+    n = 0
+    while True:
+        j = line.find('```', i)
+        if j == -1:
+            return n
+        bs = 0
+        k = j - 1
+        while k >= 0 and line[k] == '\\':
+            bs += 1
+            k -= 1
+        if bs % 2 == 0:
+            n += 1
+        i = j + 3
+
+
+def _mdv2_rechunk(formatted: str, max_length: int, len_fn) -> "Optional[List[str]]":
+    """Split formatted MarkdownV2 text at line boundaries into parse-safe chunks.
+
+    Inline entities never span lines in format_message() output, so cutting at
+    newlines keeps every entity whole. Fenced code blocks are the exception —
+    a chunk boundary inside a fence closes it and reopens it (with language
+    tag) at the top of the next chunk, mirroring truncate_message()'s fence
+    handling. Chunk indicators are appended pre-escaped ("\\(1/3\\)").
+
+    Returns None when a compliant split is impossible (a single line longer
+    than the budget, or a resulting chunk that still fails the balance scan);
+    the caller then keeps the generic chunks and relies on the existing
+    plain-text fallback.
+    """
+    budget = max_length - 24  # headroom: fence reopen + " \\(NN/NN\\)"
+    if budget < 256:
+        return None
+    lines = formatted.split('\n')
+    raw_chunks = []
+    cur = []
+    cur_len = 0
+    in_fence = False
+    fence_open = '```'
+    for line in lines:
+        line_len = len_fn(line)
+        if line_len > budget:
+            return None
+        joiner = 1 if cur else 0
+        if cur and cur_len + joiner + line_len > budget:
+            if in_fence:
+                cur.append('```')
+                raw_chunks.append('\n'.join(cur))
+                cur = [fence_open]
+                cur_len = len_fn(fence_open)
+            else:
+                raw_chunks.append('\n'.join(cur))
+                cur = []
+                cur_len = 0
+            joiner = 1 if cur else 0
+        cur.append(line)
+        cur_len += joiner + line_len
+        if _mdv2_fence_toggles(line) % 2:
+            in_fence = not in_fence
+            if in_fence:
+                tag = line.strip()
+                if tag.startswith('```') and '```' not in tag[3:]:
+                    fence_open = tag
+                else:
+                    fence_open = '```'
+    if cur:
+        raw_chunks.append('\n'.join(cur))
+    if len(raw_chunks) < 2:
+        return raw_chunks or None
+    total = len(raw_chunks)
+    out = []
+    for idx, chunk in enumerate(raw_chunks, 1):
+        indicator = '\\({0}/{1}\\)'.format(idx, total)
+        if chunk.rstrip().endswith('```'):
+            candidate = chunk + '\n' + indicator
+        else:
+            candidate = chunk + ' ' + indicator
+        if len_fn(candidate) > max_length or not _mdv2_chunk_balanced(candidate):
+            return None
+        out.append(candidate)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Markdown table → Telegram-friendly row groups
 # ---------------------------------------------------------------------------
 # Telegram's MarkdownV2 has no table syntax — '|' is just an escaped literal,
@@ -3301,6 +3430,18 @@ class TelegramAdapter(BasePlatformAdapter):
             chunks = self.truncate_message(
                 formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
             )
+            if len(chunks) > 1 and not all(
+                _mdv2_chunk_balanced(_c) for _c in chunks
+            ):
+                # 2026-07-11: the generic split cut a MarkdownV2 entity in
+                # half (Telegram rejects the chunk -> plain-text degrade ->
+                # 'garbage text'). Re-split at line boundaries so every
+                # chunk parses on its own; keep generic chunks if impossible.
+                _safe_chunks = _mdv2_rechunk(
+                    formatted, self.MAX_MESSAGE_LENGTH, utf16_len,
+                )
+                if _safe_chunks:
+                    chunks = _safe_chunks
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
